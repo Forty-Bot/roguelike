@@ -2,6 +2,7 @@
 import libtcodpy as libtcod
 import math
 import textwrap
+import shelve
 
 SCREEN_WIDTH	= 80
 SCREEN_HEIGHT	= 50
@@ -43,7 +44,7 @@ color_dark_ground = libtcod.Color(50, 50, 150)
 color_light_ground = color_dark_ground + libtcod.dark_grey
 
 class Object:  #generic object
-	def __init__(self, x, y, char, name, color, blocks=False,
+	def __init__(self, x, y, char, name, color, blocks=False, always_visible=None,
 		fighter=None, ai=None, item=None):
 		self.x = x
 		self.y = y
@@ -51,6 +52,7 @@ class Object:  #generic object
 		self.name = name
 		self.color = color
 		self.blocks = blocks
+		self.always_visible = always_visible
 		self.fighter = fighter
 		self.ai = ai
 		self.item = item
@@ -60,6 +62,11 @@ class Object:  #generic object
 			self.ai.owner = self
 		if self.item:
 			self.item.owner = self
+		if always_visible is None:
+			if self.item is not None:
+				self.always_visible = True
+			else:
+				self.always_visible = False
 
 	def move(self, dx, dy):  #move by a given amount
 		if not is_blocked(self.x + dx, self.y + dy):
@@ -67,7 +74,7 @@ class Object:  #generic object
 			self.y += dy
 
 	def draw(self):  #draw the object
-		if libtcod.map_is_in_fov(fov_map, self.x, self.y):
+		if libtcod.map_is_in_fov(fov_map, self.x, self.y) or (self.always_visible and map[self.x][self.y].explored):
 			libtcod.console_set_default_foreground(con, self.color)
 			libtcod.console_put_char(con, self.x, self.y, self.char, libtcod.BKGND_NONE)
 
@@ -81,6 +88,11 @@ class Object:  #generic object
 
 		dx = int(round(dx / distance))
 		dy = int(round(dy / distance))
+
+
+		if is_blocked(self.x + dx, self.y): dx = 0
+		if is_blocked(self.x, self.y+dy): dy = 0
+
 		self.move(dx, dy)
 
 	def distance_to(self, other):
@@ -240,7 +252,9 @@ def create_v_tunnel(y1, y2, x):  #Create a vertical tunnel from (x, y1) to (x, y
 		map[x][y].opaque = False
 
 def make_map():
-	global map
+	global map, objects, stairs
+
+	objects = [player]
 
 	map = [[ Tile(True)  #Tiles start out impassable/opaque
 		for y in range(MAP_HEIGHT) ]
@@ -292,6 +306,10 @@ def make_map():
 			rooms.append(new_room)
 			num_rooms += 1
 
+	stairs = Object(new_x, new_y, '>', 'down stairs', libtcod.white, always_visible=True)
+	objects.append(stairs)
+	stairs.send_to_back()
+
 
 
 def render_all():
@@ -339,6 +357,7 @@ def render_all():
 	libtcod.console_set_default_foreground(panel, libtcod.white)
 	libtcod.console_print_ex(panel, 1, 2, libtcod.BKGND_NONE, libtcod.LEFT, 'POW: '+str(player.fighter.power))
 	libtcod.console_print_ex(panel, 1, 3, libtcod.BKGND_NONE, libtcod.LEFT, 'DEF: '+str(player.fighter.defense))
+	libtcod.console_print_ex(panel, 1, 4, libtcod.BKGND_NONE, libtcod.LEFT, 'DLVL: '+str(dungeon_level))
 	libtcod.console_blit(panel, 0, 0, SCREEN_WIDTH, PANEL_HEIGHT, 0, 0, PANEL_Y)
 
 def place_objects(room):
@@ -423,6 +442,9 @@ def monster_death(monster):
 	monster.fighter = None
 	monster.ai = None
 	monster.name = monster.name+' corpse'
+	monster.item = Item()
+	monster.item.owner = monster
+	monster.always_visible = True
 	monster.send_to_back()
 
 def is_blocked(x, y):
@@ -493,12 +515,16 @@ def menu(header, options, width):
 
 	#Calculate the height of the menu
 	header_height = libtcod.console_get_height_rect(con, 0, 0, width, SCREEN_HEIGHT, header)
+	if header == '':
+		header_height = 0
 	height = len(options) + header_height
 
+	#Make a new console and print the header
 	window = libtcod.console_new(width, height)
 	libtcod.console_set_default_foreground(window, libtcod.white)
 	libtcod.console_print_rect_ex(window, 0, 0, width, height, libtcod.BKGND_NONE, libtcod.LEFT, header)
 
+	#Print the options
 	y = header_height
 	letter_index = ord('a')
 	for option_text in options:
@@ -513,7 +539,11 @@ def menu(header, options, width):
 
 	libtcod.console_flush()
 	key = libtcod.Key()
+	mouse = libtcod.Mouse()
 	libtcod.sys_wait_for_event(libtcod.EVENT_KEY_PRESS, key, mouse, True)
+
+	if key.vk == libtcod.KEY_ENTER and key.lalt:  #(special case) Alt+Enter: toggle fullscreen
+		libtcod.console_set_fullscreen(not libtcod.console_is_fullscreen())
 
 	index = key.c - ord('a')
 	if index >= 0 and index < len(options): return index
@@ -531,6 +561,9 @@ def inventory_menu(header):
 	if index is None:
 		return None
 	return inventory[index]
+
+def msg_box(text, width=50):
+	menu(text, [], width)
 
 def handle_keys():
 	global playerx, playery
@@ -563,15 +596,24 @@ def handle_keys():
 				player_move_or_attack(-1, 1)
 			elif key.c == ord('n'):
 				player_move_or_attack(1, 1)
+			elif key.c == ord('>'):
+				if player.x == stairs.x and player.y == stairs.y:
+					next_level()
 			elif key.c == ord('.'):
 				pass #wait a turn
 			elif key.c == ord(','):
-				for object in objects:  #pick up the first item under the player
-					if object.x == player.x and object.y == player.y and object.item:
-						object.item.pick_up()
-						break
+				items = [object for object in objects if object.x == player.x and object.y == player.y and object.item ]
+				if len(items) > 1:
+					index = menu('Pick up what?', [ item.name for item in items ], INVENTORY_WIDTH)
+					if index is not None:
+						items[index].item.pick_up()
+					else:
+						return 'didnt-take-turn'
+				elif len(items) == 1:
+					items[0].item.pick_up()
 				else:
-					message('Nothing to pick up here', libtcod.green)
+					message('No items to pick up')
+					return 'didnt-take-turn'
 			elif key.c == ord('i'):
 				inventory_menu('Inventory')
 				return 'didnt-take-turn'
@@ -593,65 +635,142 @@ def handle_keys():
 
 	return 'didnt-take-turn'
 
+def save_game():
+	file = shelve.open('game.sav', 'n')
+	file['map'] = map
+	file['objects'] = objects
+	file['player_index'] = objects.index(player)
+	file['stairs_index'] = objects.index(stairs)
+	file['inventory'] = inventory
+	file['game_msgs'] = game_msgs
+	file['game_state'] = game_state
+	file['dungeon_level'] = dungeon_level
+	file.close()
+
+def load_game():
+	global map, objects, player, stairs, inventory, game_msgs, game_state, dungeon_level
+
+	file = shelve.open('game.sav', 'r')
+	map = file['map']
+	objects = file['objects']
+	player = objects[file['player_index']]
+	stairs = objects[file['stairs_index']]
+	inventory = file['inventory']
+	game_msgs = file['game_msgs']
+	game_state = file['game_state']
+	dungeon_level = file['dungeon_level']
+	file.close()
+
+	fov_init()
+
+def new_game():
+	global player, inventory, game_msgs, game_state, dungeon_level
+
+	#Object init
+	fighter_component = Fighter(hp=30, defense=2, power=5, death_function=player_death)
+	player = Object(SCREEN_WIDTH/2, SCREEN_HEIGHT/2, '@', 'player', libtcod.darkest_gray, blocks=True, fighter=fighter_component)
+	#npc = Object(SCREEN_WIDTH/2, SCREEN_HEIGHT/2 +5, '@', libtcod.white)
+
+	#Inventory init
+	inventory = []
+
+	#Map init
+	dungeon_level = 1
+	make_map()
+
+	fov_init()
+
+	#State init
+	game_state = 'playing'
+
+	#Message init
+	game_msgs = []
+
+	message('Welcome stranger! Prepare to perish in the Halls of the Ancients.', libtcod.red)
+
+def next_level():
+	global dungeon_level
+
+	dungeon_level += 1
+	make_map()
+	fov_init()
+
+def fov_init():
+	global fov_map, fov_recompute
+
+	fov_map = libtcod.map_new(MAP_WIDTH, MAP_HEIGHT)
+	for y in range(MAP_HEIGHT):
+		for x in range(MAP_WIDTH):
+			libtcod.map_set_properties(fov_map, x, y, not map[x][y].opaque, not map[x][y].blocked)
+	fov_recompute = True
+
+	libtcod.console_clear(con)
+
+def play_game():
+	global key, mouse
+
+	player_action= None
+
+	#Input init
+	mouse = libtcod.Mouse()
+	key = libtcod.Key()
+
+	while not libtcod.console_is_window_closed():
+
+		libtcod.sys_check_for_event(libtcod.EVENT_KEY_PRESS|libtcod.EVENT_MOUSE, key, mouse)
+
+		render_all()
+		libtcod.console_flush()
+
+		for object in objects:
+			object.clear()
+
+		#handle keys and/or exit
+		player_action = handle_keys()
+		if player_action == 'exit':
+			save_game()
+			break
+
+		#ai
+		if game_state == 'playing' and player_action != 'didnt-take-turn':
+			for object in objects:
+				if object.ai:
+					object.ai.take_turn()
+
+def main_menu():
+	img = libtcod.image_load('menu.png')
+
+	while not libtcod.console_is_window_closed():
+		libtcod.image_blit_2x(img, 0, 0, 0)
+
+		libtcod.console_set_default_foreground(0, libtcod.yellow)
+		libtcod.console_print_ex(0, SCREEN_WIDTH/2, SCREEN_HEIGHT/2-4, libtcod.BKGND_NONE, libtcod.CENTER,
+			'The Halls of the Ancients')
+		libtcod.console_print_ex(0, SCREEN_WIDTH/2, SCREEN_HEIGHT-2, libtcod.BKGND_NONE, libtcod.CENTER,
+			'By Forty-Bot')
+
+		choice = menu('', ['New game', 'Continue', 'Quit'], 24)
+
+		if choice == 0:
+			new_game()
+			play_game()
+		elif choice == 1:
+			try:
+				load_game()
+			except:
+				msg_box('\nError loading save\n', 24)
+				continue
+			play_game()
+		elif choice == 2:
+			break
+
 #Graphics init
 libtcod.console_set_custom_font('dejavu10x10_gs_tc.png', libtcod.FONT_TYPE_GREYSCALE | libtcod.FONT_LAYOUT_TCOD)
-libtcod.console_init_root(SCREEN_WIDTH, SCREEN_HEIGHT, 'python/lobtcod tutorial', False)
+libtcod.console_init_root(SCREEN_WIDTH, SCREEN_HEIGHT, 'roguelike', False)
 con = libtcod.console_new(MAP_WIDTH, MAP_HEIGHT)
 libtcod.sys_set_fps(LIMIT_FPS)
 
 #UI init
 panel = libtcod.console_new(SCREEN_WIDTH, PANEL_HEIGHT)
-game_msgs = []
 
-#Object init
-fighter_component = Fighter(hp=30, defense=2, power=5, death_function=player_death)
-player = Object(SCREEN_WIDTH/2, SCREEN_HEIGHT/2, '@', 'player', libtcod.darkest_gray, blocks=True, fighter=fighter_component)
-#npc = Object(SCREEN_WIDTH/2, SCREEN_HEIGHT/2 +5, '@', libtcod.white)
-objects = [player]
-
-#Inventory init
-inventory = []
-
-#Map init
-make_map()
-
-#Fov init
-fov_map = libtcod.map_new(MAP_WIDTH, MAP_HEIGHT)
-for y in range(MAP_HEIGHT):
-	for x in range(MAP_WIDTH):
-		libtcod.map_set_properties(fov_map, x, y, not map[x][y].opaque, not map[x][y].blocked)
-fov_recompute = True
-
-#Pathfinding init
-#path_map = libtcod.path_new_using_map(fov_map, 1)
-
-#State init
-game_state = 'playing'
-player_action= None
-
-#Input init
-mouse = libtcod.Mouse()
-key = libtcod.Key()
-
-message('Welcome stranger! Prepare to perish in the Halls of the Ancients.', libtcod.red)
-
-while not libtcod.console_is_window_closed():
-
-	libtcod.sys_check_for_event(libtcod.EVENT_KEY_PRESS|libtcod.EVENT_MOUSE, key, mouse)
-
-	render_all()
-	libtcod.console_flush()
-
-	for object in objects:
-		object.clear()
-
-	#handle keys and/or exit
-	player_action = handle_keys()
-	if player_action == 'exit':
-		break
-
-	#ai
-	if game_state == 'playing' and player_action != 'didnt-take-turn':
-		for object in objects:
-			if object.ai:
-				object.ai.take_turn()
+main_menu()
